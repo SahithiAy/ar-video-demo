@@ -1,300 +1,406 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-  <title>Holo-Twin QR AR Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Holo‑Twin AR — QR Anchor Demo (Permission-safe)</title>
   <style>
-    html,body { height:100%; margin:0; overflow:hidden; background:#000; }
-    #container { position:fixed; inset:0; }
-    /* keep the camera video hidden (we use it as texture) */
-    #camVideo { display:none; }
-    /* debug: small canvas showing what we feed to jsQR */
-    #qrDebug { position:fixed; right:8px; bottom:8px; width:160px; height:auto; border:2px solid rgba(255,255,255,0.12); z-index:999; }
-    #message { position:fixed; left:12px; top:12px; z-index:999; padding:8px 12px; background:rgba(0,0,0,0.4); color:#fff; border-radius:6px; font-family:monospace; font-size:13px; }
-    #controls { position:fixed; left:12px; bottom:12px; z-index:999; }
-    button { font-size:14px; padding:8px 10px; }
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Inter,system-ui,Arial}
+    #app{position:fixed;inset:0;overflow:hidden}
+    canvas{display:block}
+    video{max-width:100%}
+    #camVideo{display:none}
+    #overlayVideo{display:none}
+    #qrDebug{position:fixed;right:10px;bottom:10px;width:160px;z-index:800;border:1px solid rgba(255,255,255,0.08);background:#000}
+    #ui{position:fixed;left:12px;top:12px;z-index:900;max-width:calc(100% - 48px)}
+    .btn{background:#0b84ff;border:none;padding:10px 14px;border-radius:8px;color:#fff;font-weight:600;margin-right:8px}
+    .muted{background:#444}
+    #msg{margin-top:8px;background:rgba(0,0,0,0.55);padding:10px;border-radius:6px;font-size:13px;line-height:1.3}
+    #controls{margin-top:8px}
+    #fallback{margin-top:10px;background:rgba(255,255,255,0.03);padding:8px;border-radius:6px}
+    input[type=file]{display:inline-block}
+    a.link{color:#aee; text-decoration:underline}
   </style>
 </head>
 <body>
-  <div id="container"></div>
+  <div id="app"></div>
 
+  <!-- hidden cameras/videos used as textures -->
   <video id="camVideo" autoplay playsinline muted></video>
-  <video id="overlayVideo" autoplay playsinline muted loop crossorigin="anonymous" style="display:none"></video>
-  <canvas id="qrDebug"></canvas>
+  <video id="overlayVideo" autoplay playsinline muted loop crossorigin="anonymous"></video>
+  <canvas id="qrDebug" hidden></canvas>
 
-  <div id="message">Loading…</div>
-  <div id="controls"><button id="btnStart">Start AR</button></div>
+  <div id="ui">
+    <div>
+      <button id="startBtn" class="btn">Start AR (Open Camera)</button>
+      <button id="retryBtn" class="btn muted">Retry Camera</button>
+      <button id="useUploadBtn" class="btn muted">Upload Background</button>
+      <input id="bgUpload" type="file" accept="image/*,video/*" style="display:none" />
+    </div>
+    <div id="msg">Ready — press <strong>Start AR</strong> to begin. If you see "Permission denied" follow the instructions below.</div>
+    <div id="fallback" hidden>
+      <strong>Troubleshooting / Fixes</strong>
+      <ol style="padding-left:18px;margin:6px 0 0 0;font-size:13px;">
+        <li>If you denied camera access, open your browser settings and allow camera for this site, then click <em>Retry Camera</em>.</li>
+        <li>Make sure you're using <strong>HTTPS</strong> (GitHub Pages, Vercel, Netlify). Localhost also works (http://localhost).</li>
+        <li>If camera can't be used, upload an image or video that contains the printed QR (use <em>Upload Background</em>).</li>
+      </ol>
+      <div style="margin-top:8px;font-size:13px">Need a hosted URL for testing? Use <a class="link" href="https://vercel.com/" target="_blank" rel="noreferrer">Vercel</a> or <a class="link" href="https://pages.github.com/" target="_blank" rel="noreferrer">GitHub Pages</a>.</div>
+    </div>
+  </div>
 
-  <!-- Libraries (CDN) -->
+  <!-- libs -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.153.0/build/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jsqr/dist/jsQR.js"></script>
 
   <script>
-  // ---------- CONFIG ----------
-  const QR_SCAN_INTERVAL = 120;  // ms between QR decode attempts (tune for perf)
-  const DETECT_WIDTH = 480;      // width of the small canvas we decode from (keeps CPU low)
-  // Chroma key parameters (tune if needed)
-  const KEY_COLOR = { r:0.0, g:1.0, b:0.0 }; // pure green reference
-  const SIMILARITY = 0.35;  // lower = stricter key; higher = remove more green
-  const SMOOTHNESS = 0.12;  // softness at edges
+  /*
+    Holo‑Twin QR AR demo — Permission-safe version
 
-  // ---------- DOM ----------
-  const container = document.getElementById('container');
+    Changes made to avoid the NotAllowedError crash and guide the user:
+    - Checks secure context (HTTPS/localhost) and shows clear instructions if not secure
+    - Uses navigator.permissions when available to check camera permission state before requesting
+    - Catches NotAllowedError / PermissionDeniedError and shows guidance with a retry and fallback upload option
+    - Allows uploading an image/video to simulate camera if permission cannot be granted
+    - Keeps the original Three.js + jsQR flow intact when camera or uploaded file is available
+  */
+
+  // -------- CONFIG --------
+  const VIDEO_FILENAME = 'greenscreen.mp4'; // overlay (greenscreen) video — keep in same folder when deploying
+  const QR_SCAN_INTERVAL = 120; // ms
+  const DETECT_WIDTH = 480; // px for detection canvas
+  const CHROMA = { similarity: 0.32, smoothness: 0.10, keyColor: { r:0.0, g:1.0, b:0.0 } };
+  const LERP = { pos: 0.18, quat: 0.18, scale: 0.18 };
+
+  // -------- DOM --------
   const camVideo = document.getElementById('camVideo');
   const overlayVideo = document.getElementById('overlayVideo');
   const qrDebug = document.getElementById('qrDebug');
-  const message = document.getElementById('message');
-  const startBtn = document.getElementById('btnStart');
+  const startBtn = document.getElementById('startBtn');
+  const retryBtn = document.getElementById('retryBtn');
+  const useUploadBtn = document.getElementById('useUploadBtn');
+  const bgUpload = document.getElementById('bgUpload');
+  const msg = document.getElementById('msg');
+  const fallback = document.getElementById('fallback');
+  const app = document.getElementById('app');
 
-  // Replace with your video filename
-  overlayVideo.src = 'greenscreen.mp4'; // put your greenscreen file in same folder
+  overlayVideo.src = VIDEO_FILENAME;
 
-  // detection canvas (off-screen)
+  // offscreen detect canvas
   const detectCanvas = document.createElement('canvas');
   const detectCtx = detectCanvas.getContext('2d');
 
-  // ---------- Three.js setup ----------
-  let renderer, scene, camera, planeMesh, videoTexture;
-  let lastDetect = 0;
-  let qrFound = null;
-  let renderSize = new THREE.Vector2();
+  // threejs variables
+  let renderer, scene, camera, plane, videoTexture, renderSize = new THREE.Vector2();
+  let lastDetected = null;
+  let target = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), scale: new THREE.Vector3(1,1,1) };
+  let qrIntervalId = null;
 
-  function initThree() {
+  // -------- helpers --------
+  function setMsg(html){ msg.innerHTML = html }
+  function showFallback(){ fallback.hidden = false }
+  function hideFallback(){ fallback.hidden = true }
+
+  function isSecureContextForCamera(){
+    // Browsers require HTTPS or localhost for camera access
+    return (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+  }
+
+  async function cameraPermissionState(){
+    if (!navigator.permissions || !navigator.permissions.query) return 'unknown';
+    try{
+      // Some browsers don't support 'camera' permission name — wrap in try/catch
+      const p = await navigator.permissions.query({ name: 'camera' });
+      return p.state; // 'granted', 'prompt', 'denied'
+    }catch(e){
+      return 'unknown';
+    }
+  }
+
+  async function getCameraStream(){
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('getUserMedia not supported in this browser');
+    return await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  }
+
+  // -------- Three.js init --------
+  function initThree(){
+    if (renderer) return;
     renderer = new THREE.WebGLRenderer({ alpha:true, antialias:true });
     renderer.setPixelRatio(window.devicePixelRatio || 1);
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.domElement.style.position = 'absolute';
     renderer.domElement.style.top = '0';
     renderer.domElement.style.left = '0';
-    container.appendChild(renderer.domElement);
+    app.appendChild(renderer.domElement);
 
     scene = new THREE.Scene();
-    // camera fov approximated for phone; you can tune later
-    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.001, 1000);
     camera.position.set(0,0,0);
 
-    // video texture from overlay video (greenscreen person)
+    // video texture
     videoTexture = new THREE.VideoTexture(overlayVideo);
     videoTexture.minFilter = THREE.LinearFilter;
     videoTexture.magFilter = THREE.LinearFilter;
     videoTexture.format = THREE.RGBAFormat;
 
-    // custom chroma-key shader
-    const vertexShader = `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
-      }
-    `;
-
-    const fragmentShader = `
-      uniform sampler2D videoTex;
-      uniform vec3 keyColor;
-      uniform float similarity;
-      uniform float smoothness;
-      varying vec2 vUv;
-
-      // convert rgb to luma (used for color distance)
-      float lum(vec3 c) {
-        return dot(c, vec3(0.299, 0.587, 0.114));
-      }
-
-      void main() {
-        vec4 c = texture2D(videoTex, vUv);
-        // compute color distance (Euclidean)
-        float d = distance(c.rgb, keyColor);
-        // create alpha via smoothstep
-        float a = smoothstep(similarity, similarity + smoothness, d);
-        // if mostly keyed (small d), discard pixel to be fully transparent
-        if (a < 0.01) discard;
-
-        gl_FragColor = vec4(c.rgb, a);
-      }
-    `;
+    // shader material (chroma key)
+    const vertex = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+    const fragment = `uniform sampler2D tMap; uniform vec3 keyColor; uniform float similarity; uniform float smoothness; varying vec2 vUv;\n      void main(){ vec4 c = texture2D(tMap, vUv); float d = distance(c.rgb, keyColor); float alpha = smoothstep(similarity, similarity + smoothness, d); if (alpha < 0.01) discard; gl_FragColor = vec4(c.rgb, alpha); }`;
 
     const mat = new THREE.ShaderMaterial({
-      uniforms: {
-        videoTex: { value: videoTexture },
-        keyColor: { value: new THREE.Color(KEY_COLOR.r, KEY_COLOR.g, KEY_COLOR.b) },
-        similarity: { value: SIMILARITY },
-        smoothness: { value: SMOOTHNESS }
-      },
-      vertexShader,
-      fragmentShader,
+      uniforms: { tMap: { value: videoTexture }, keyColor: { value: new THREE.Color(CHROMA.keyColor.r, CHROMA.keyColor.g, CHROMA.keyColor.b) }, similarity: { value: CHROMA.similarity }, smoothness: { value: CHROMA.smoothness } },
+      vertexShader: vertex,
+      fragmentShader: fragment,
       transparent: true,
       depthTest: true,
       side: THREE.DoubleSide
     });
 
-    const geometry = new THREE.PlaneGeometry(1,1,1,1);
-    planeMesh = new THREE.Mesh(geometry, mat);
-    planeMesh.visible = false; // until QR found
-    scene.add(planeMesh);
+    const geo = new THREE.PlaneGeometry(1,1,1,1);
+    plane = new THREE.Mesh(geo, mat);
+    plane.visible = false;
+    scene.add(plane);
 
-    window.addEventListener('resize', onWindowResize);
-    onWindowResize();
+    window.addEventListener('resize', onResize);
+    onResize();
     animate();
   }
 
-  function onWindowResize(){
-    const w = window.innerWidth, h = window.innerHeight;
-    renderer.setSize(w,h);
-    camera.aspect = w/h;
+  function onResize(){
+    if (!renderer) return;
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    camera.aspect = window.innerWidth/window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.getSize(renderSize);
   }
 
-  // ---------- QR detection & mapping to 3D ----------
-  function startQRCodeLoop(){
-    // set detect canvas size proportional to camera video
-    const vw = camVideo.videoWidth, vh = camVideo.videoHeight;
-    const scale = DETECT_WIDTH / vw;
-    detectCanvas.width = DETECT_WIDTH;
-    detectCanvas.height = Math.round(vh * scale);
-
-    qrDebug.width = detectCanvas.width;
-    qrDebug.height = detectCanvas.height;
-
-    setInterval(() => {
-      if (camVideo.readyState < 2) return;
-      detectCtx.drawImage(camVideo, 0, 0, detectCanvas.width, detectCanvas.height);
-      const img = detectCtx.getImageData(0,0,detectCanvas.width, detectCanvas.height);
-      const code = jsQR(img.data, img.width, img.height, { inversionAttempts: "dontInvert" });
-      // draw debug
-      const dctx = qrDebug.getContext('2d');
-      dctx.putImageData(img,0,0);
-      dctx.strokeStyle = 'lime';
-      dctx.lineWidth = 2;
-      dctx.beginPath();
-
-      if (code) {
-        // code.location has corners in detectCanvas coordinates
-        const corners = {
-          topLeft: code.location.topLeftCorner,
-          topRight: code.location.topRightCorner,
-          bottomLeft: code.location.bottomLeftCorner,
-          bottomRight: code.location.bottomRightCorner
-        };
-        drawCornerBox(dctx, corners);
-        qrFound = mapCornersToScreen(corners);
-        planeMesh.visible = true;
-        // apply transform
-        applyTransformFromScreenCorners(qrFound);
-      } else {
-        // not found
-        // optionally hide or keep last known
-        // planeMesh.visible = false;
-      }
-    }, QR_SCAN_INTERVAL);
-  }
-
-  function drawCornerBox(dctx, corners) {
-    dctx.beginPath();
-    dctx.moveTo(corners.topLeft.x, corners.topLeft.y);
-    dctx.lineTo(corners.topRight.x, corners.topRight.y);
-    dctx.lineTo(corners.bottomRight.x, corners.bottomRight.y);
-    dctx.lineTo(corners.bottomLeft.x, corners.bottomLeft.y);
-    dctx.closePath();
-    dctx.stroke();
-  }
-
-  // Map corners from detectCanvas → screen pixel coords (renderer dom size)
-  function mapCornersToScreen(corners){
-    const rw = renderSize.x, rh = renderSize.y;
-    const sx = rw / detectCanvas.width;
-    const sy = rh / detectCanvas.height;
-
-    return {
-      topLeft: { x: corners.topLeft.x * sx, y: corners.topLeft.y * sy },
-      topRight: { x: corners.topRight.x * sx, y: corners.topRight.y * sy },
-      bottomLeft: { x: corners.bottomLeft.x * sx, y: corners.bottomLeft.y * sy },
-      bottomRight: { x: corners.bottomRight.x * sx, y: corners.bottomRight.y * sy }
-    };
-  }
-
-  // Convert screen corners into world coords, then set plane position + rotation + scale
-  function applyTransformFromScreenCorners(c) {
-    // helper: screen (px) -> NDC -> unproject to world at chosen z
-    const pTL = screenToWorld(c.topLeft);
-    const pTR = screenToWorld(c.topRight);
-    const pBL = screenToWorld(c.bottomLeft);
-    const pBR = screenToWorld(c.bottomRight);
-
-    // compute basis: right and up in world units
-    const right = new THREE.Vector3().subVectors(pTR, pTL).normalize();
-    const up = new THREE.Vector3().subVectors(pBL, pTL).normalize();
-    const normal = new THREE.Vector3().crossVectors(right, up).normalize();
-
-    // make rotation matrix from basis
-    const m = new THREE.Matrix4();
-    m.makeBasis(right, up, normal);
-    planeMesh.quaternion.setFromRotationMatrix(m);
-
-    // center
-    const center = new THREE.Vector3().addVectors(pTL, pTR).add(pBL).add(pBR).multiplyScalar(0.25);
-    planeMesh.position.copy(center);
-
-    // scale plane to match width and height (plane geometry is 1x1)
-    const width = pTR.distanceTo(pTL);
-    const height = pBL.distanceTo(pTL);
-    planeMesh.scale.set(width, height, 1);
-  }
-
-  // screen point (pixel coords relative to renderer dom) -> world point
-  function screenToWorld(screenPt) {
-    // get NDC
-    const rw = renderSize.x, rh = renderSize.y;
-    const ndcX = (screenPt.x / rw) * 2 - 1;
-    const ndcY = - (screenPt.y / rh) * 2 + 1;
-    // choose a depth in NDC [-1..1] -- 0.5 is halfway into camera frustum (tweak if needed)
-    const ndc = new THREE.Vector3(ndcX, ndcY, 0.5);
+  // -------- screen->world helpers --------
+  function screenToWorld(screenPt, zDepth = 0.5){
+    const rw = renderSize.x || window.innerWidth, rh = renderSize.y || window.innerHeight;
+    const ndc = new THREE.Vector3((screenPt.x / rw) * 2 - 1, - (screenPt.y / rh) * 2 + 1, zDepth * 2 - 1);
     ndc.unproject(camera);
     return ndc;
   }
 
-  // ---------- camera setup ----------
-  async function startCamera() {
-    message.textContent = 'Requesting camera...';
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  function applyCornersToPlane(corners){
+    const pTL = screenToWorld(corners.topLeft, 0.45);
+    const pTR = screenToWorld(corners.topRight, 0.45);
+    const pBL = screenToWorld(corners.bottomLeft, 0.45);
+    const pBR = screenToWorld(corners.bottomRight, 0.45);
+
+    const right = new THREE.Vector3().subVectors(pTR, pTL);
+    const down = new THREE.Vector3().subVectors(pBL, pTL);
+    const normal = new THREE.Vector3().crossVectors(right, down).normalize();
+
+    const m = new THREE.Matrix4();
+    const rNorm = right.clone().normalize();
+    const dNorm = down.clone().normalize();
+    m.makeBasis(rNorm, dNorm, normal);
+    const q = new THREE.Quaternion().setFromRotationMatrix(m);
+
+    const center = new THREE.Vector3().addVectors(pTL, pTR).add(pBL).add(pBR).multiplyScalar(0.25);
+    const width = pTR.distanceTo(pTL);
+    const height = pBL.distanceTo(pTL);
+
+    target.pos.copy(center);
+    target.quat.copy(q);
+    target.scale.set(width, height, 1);
+    plane.visible = true;
+  }
+
+  function smoothUpdate(){
+    if (!plane) return;
+    plane.position.lerp(target.pos, LERP.pos);
+    plane.quaternion.slerp(target.quat, LERP.quat);
+    plane.scale.lerp(target.scale, LERP.scale);
+  }
+
+  // -------- QR detection --------
+  function startQRLoop(){
+    if (qrIntervalId) clearInterval(qrIntervalId);
+
+    // Ensure camVideo has metadata
+    if (!camVideo.videoWidth || !camVideo.videoHeight) {
+      // try again soon
+      qrIntervalId = setTimeout(startQRLoop, 200);
+      return;
+    }
+
+    const vw = camVideo.videoWidth, vh = camVideo.videoHeight;
+    const scale = Math.max(1, DETECT_WIDTH / vw);
+    detectCanvas.width = Math.round(vw * scale);
+    detectCanvas.height = Math.round(vh * scale);
+    qrDebug.width = detectCanvas.width;
+    qrDebug.height = detectCanvas.height;
+    qrDebug.hidden = false;
+
+    qrIntervalId = setInterval(()=>{
+      try{
+        if (camVideo.readyState < 2) return;
+        detectCtx.drawImage(camVideo, 0, 0, detectCanvas.width, detectCanvas.height);
+        const img = detectCtx.getImageData(0,0,detectCanvas.width,detectCanvas.height);
+        const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+
+        const dctx = qrDebug.getContext('2d');
+        dctx.putImageData(img,0,0);
+        dctx.strokeStyle = 'lime'; dctx.lineWidth = 2;
+
+        if (code && code.location){
+          const toScreen = (pt) => ({ x: pt.x * (renderSize.x / detectCanvas.width || 1), y: pt.y * (renderSize.y / detectCanvas.height || 1) });
+          const corners = {
+            topLeft: toScreen(code.location.topLeftCorner),
+            topRight: toScreen(code.location.topRightCorner),
+            bottomLeft: toScreen(code.location.bottomLeftCorner),
+            bottomRight: toScreen(code.location.bottomRightCorner)
+          };
+          dctx.beginPath(); dctx.moveTo(code.location.topLeftCorner.x, code.location.topLeftCorner.y); dctx.lineTo(code.location.topRightCorner.x, code.location.topRightCorner.y); dctx.lineTo(code.location.bottomRightCorner.x, code.location.bottomRightCorner.y); dctx.lineTo(code.location.bottomLeftCorner.x, code.location.bottomLeftCorner.y); dctx.closePath(); dctx.stroke();
+
+          lastDetected = corners;
+          applyCornersToPlane(corners);
+          setMsg('QR found — anchor placed');
+        } else {
+          setMsg('Point the camera at the QR to anchor the hologram');
+        }
+      }catch(e){
+        console.warn('QR loop error', e);
+      }
+    }, QR_SCAN_INTERVAL);
+  }
+
+  // -------- Camera startup & flow (robust) --------
+  async function startCameraFlow(){
+    hideFallback();
+    setMsg('Checking environment...');
+
+    if (!isSecureContextForCamera()){
+      setMsg('<strong>Insecure context:</strong> camera access requires HTTPS or localhost.\nHost the files on GitHub Pages / Vercel or use localhost for testing.\nYou can also <em>Upload Background</em> to simulate the camera.');
+      showFallback();
+      return;
+    }
+
+    const perm = await cameraPermissionState();
+    if (perm === 'denied'){
+      setMsg('Camera permission is blocked for this site. Open your browser settings, allow camera access, then click <em>Retry Camera</em>.');
+      showFallback();
+      return;
+    }
+
+    setMsg('Requesting camera permission (browser will prompt)...');
+    try{
+      const stream = await getCameraStream();
       camVideo.srcObject = stream;
       await camVideo.play();
-      message.textContent = 'Camera started';
-      // wait until video metadata ready to size things
-      await new Promise(res => {
-        if (camVideo.readyState >= 2) res();
-        else camVideo.onloadedmetadata = () => res();
-      });
+
+      setMsg('Camera started');
       initThree();
-      startQRCodeLoop();
-      // start overlay video (greenscreen)
-      overlayVideo.play().catch(e => {
-        // autoplay policies may block audio; video muted should allow
-        console.warn('Overlay video play blocked:', e);
-      });
-      message.style.display = 'none';
-    } catch (err) {
-      console.error('Camera error', err);
-      message.textContent = 'Camera permission denied or not available.';
+      startQRLoop();
+      // play overlay (muted) — autoplay policies should allow muted video
+      overlayVideo.play().catch(()=>{});
+      hideFallback();
+    }catch(e){
+      console.error('getUserMedia failed', e);
+      // provide specific, actionable messages
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError'){
+        setMsg('Permission denied: camera access was blocked.\nPlease open site settings and allow camera access, then click <em>Retry Camera</em>.');
+        showFallback();
+      } else if (e.message && e.message.includes('secure')){
+        setMsg('Insecure context: camera requires HTTPS or localhost. Host on GitHub Pages/Vercel or use ngrok/localtunnel.');
+        showFallback();
+      } else {
+        setMsg('Camera error: ' + (e.message || e.name));
+        showFallback();
+      }
     }
   }
 
-  // ---------- render loop ----------
-  function animate() {
-    requestAnimationFrame(animate);
-    if (videoTexture) videoTexture.needsUpdate = true;
-    renderer.render(scene, camera);
+  // -------- Upload fallback (simulate camera) --------
+  function handleUploadFile(file){
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    // If it's a video, set camVideo.src to the blob URL so jsQR can read frames
+    if (file.type.startsWith('video/')){
+      camVideo.srcObject = null;
+      camVideo.src = url;
+      camVideo.loop = true;
+      camVideo.muted = true;
+      camVideo.play().then(()=>{
+        initThree();
+        startQRLoop();
+        overlayVideo.play().catch(()=>{});
+        setMsg('Using uploaded video as background — point the QR in the uploaded media');
+      }).catch(err => {
+        console.error('Uploaded video play failed', err);
+        setMsg('Uploaded video could not be played.');
+      });
+    } else if (file.type.startsWith('image/')){
+      // for image, we draw it to the detectCanvas repeatedly — set camVideo to blank and use drawn image
+      const img = new Image();
+      img.onload = ()=>{
+        // draw image repeatedly to camVideo-like canvas by using detectCanvas as source for jsQR
+        // we'll set up a tiny loop that paints the image into detectCanvas and still run QR detection
+        detectCanvas.width = img.width; detectCanvas.height = img.height;
+        qrDebug.width = detectCanvas.width; qrDebug.height = detectCanvas.height; qrDebug.hidden = false;
+        const dctx = detectCtx;
+        function drawAndDetect(){
+          dctx.drawImage(img,0,0,detectCanvas.width,detectCanvas.height);
+        }
+        // run QR detection loop using the uploaded image as the frame source
+        if (qrIntervalId) clearInterval(qrIntervalId);
+        qrIntervalId = setInterval(()=>{
+          try{
+            const imgData = dctx.getImageData(0,0,detectCanvas.width,detectCanvas.height);
+            const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'attemptBoth' });
+            dctx.putImageData(imgData,0,0);
+            if (code && code.location){
+              const toScreen = (pt) => ({ x: pt.x * (renderSize.x / detectCanvas.width || 1), y: pt.y * (renderSize.y / detectCanvas.height || 1) });
+              const corners = {
+                topLeft: toScreen(code.location.topLeftCorner),
+                topRight: toScreen(code.location.topRightCorner),
+                bottomLeft: toScreen(code.location.bottomLeftCorner),
+                bottomRight: toScreen(code.location.bottomRightCorner)
+              };
+              applyCornersToPlane(corners);
+              setMsg('QR detected in uploaded image — anchor placed');
+            } else {
+              setMsg('Uploaded image loaded — make sure the QR is visible in the image');
+            }
+          }catch(err){ console.warn('upload-detect error', err); }
+        }, QR_SCAN_INTERVAL);
+
+        initThree();
+        overlayVideo.play().catch(()=>{});
+        drawAndDetect();
+        setMsg('Using uploaded image as background — detecting QR...');
+      };
+      img.src = url;
+    } else {
+      setMsg('Unsupported file type. Please upload an image or video.');
+    }
   }
 
-  startBtn.onclick = () => {
-    startBtn.disabled = true;
-    startCamera();
-  };
+  // -------- Render loop --------
+  function animate(){
+    requestAnimationFrame(animate);
+    if (videoTexture) videoTexture.needsUpdate = true;
+    if (plane && plane.visible) smoothUpdate();
+    if (renderer && scene && camera) renderer.render(scene, camera);
+  }
 
-  // small helper: allow page to auto start on some devices (if user already tapped)
-  // but we keep explicit Start button for reliability
+  // -------- UI wiring --------
+  startBtn.addEventListener('click', ()=>{ startCameraFlow(); startBtn.disabled = true; });
+  retryBtn.addEventListener('click', ()=>{ startCameraFlow(); });
+  useUploadBtn.addEventListener('click', ()=>{ bgUpload.click(); });
+  bgUpload.addEventListener('change', (ev)=>{ handleUploadFile(ev.target.files[0]); });
+
+  // expose a quick helper for debugging in console
+  window._holo_debug = { startCameraFlow };
+
+  // If page is insecure, show fallback immediately to help user
+  if (!isSecureContextForCamera()){
+    setMsg('<strong>Note:</strong> This page requires <em>HTTPS</em> or <em>localhost</em> to access camera. You can still upload an image/video to test.');
+    showFallback();
+  }
+
   </script>
 </body>
 </html>
